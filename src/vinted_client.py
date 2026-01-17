@@ -5,7 +5,7 @@ import aiohttp
 import asyncio
 import logging
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,19 @@ VINTED_DOMAINS = {
 
 
 @dataclass
+class VintedUser:
+    """Representa un vendedor de Vinted."""
+    id: int
+    login: str
+    photo_url: Optional[str] = None
+    feedback_reputation: float = 0.0
+    feedback_count: int = 0
+    is_verified: bool = False
+    country_code: Optional[str] = None
+    city: Optional[str] = None
+
+
+@dataclass
 class VintedItem:
     """Representa un artículo de Vinted."""
     id: int
@@ -40,6 +53,16 @@ class VintedItem:
     is_visible: bool
     created_at: str
     status: Optional[str]
+    # Campos avanzados
+    user: Optional[VintedUser] = None
+    total_price: Optional[float] = None  # Precio con envío
+    shipping_price: Optional[float] = None
+    free_shipping: bool = False
+    favourite_count: int = 0
+    view_count: int = 0
+    description: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, data: dict, domain: str) -> "VintedItem":
@@ -50,20 +73,107 @@ class VintedItem:
         elif data.get("photos") and len(data["photos"]) > 0:
             photo_url = data["photos"][0].get("url")
 
+        # Extraer información del usuario/vendedor
+        user_data = data.get("user", {})
+        user = None
+        if isinstance(user_data, dict) and user_data:
+            user = VintedUser(
+                id=user_data.get("id", 0),
+                login=user_data.get("login", "desconocido"),
+                photo_url=user_data.get("photo", {}).get("url") if user_data.get("photo") else None,
+                feedback_reputation=float(user_data.get("feedback_reputation", 0) or 0),
+                feedback_count=int(user_data.get("feedback_count", 0) or 0),
+                is_verified=user_data.get("verification", {}).get("email", {}).get("valid", False) if user_data.get("verification") else False,
+                country_code=user_data.get("country_code"),
+                city=user_data.get("city"),
+            )
+
+        # Extraer precio con envío
+        price_val = data.get("price", {})
+        if isinstance(price_val, dict):
+            price = float(price_val.get("amount", 0))
+            currency = price_val.get("currency_code", "EUR")
+        else:
+            price = float(price_val or 0)
+            currency = "EUR"
+
+        # Precio total con envío
+        total_price_data = data.get("total_item_price", {})
+        total_price = float(total_price_data.get("amount", 0)) if isinstance(total_price_data, dict) else None
+
+        # Precio de envío
+        service_fee = data.get("service_fee", {})
+        shipping_price = float(service_fee.get("amount", 0)) if isinstance(service_fee, dict) else None
+
         return cls(
             id=data["id"],
             title=data.get("title", "Sin título"),
-            price=float(data.get("price", {}).get("amount", 0) if isinstance(data.get("price"), dict) else data.get("price", 0)),
-            currency=data.get("price", {}).get("currency_code", "EUR") if isinstance(data.get("price"), dict) else "EUR",
+            price=price,
+            currency=currency,
             brand=data.get("brand_title") or data.get("brand"),
             size=data.get("size_title") or data.get("size"),
             url=f"https://{domain}/items/{data['id']}",
             photo_url=photo_url,
-            user_login=data.get("user", {}).get("login", "desconocido") if isinstance(data.get("user"), dict) else "desconocido",
+            user_login=user.login if user else "desconocido",
             is_visible=data.get("is_visible", True),
             created_at=data.get("created_at_ts", ""),
             status=data.get("status"),
+            user=user,
+            total_price=total_price,
+            shipping_price=shipping_price,
+            free_shipping=data.get("is_free_shipping", False),
+            favourite_count=int(data.get("favourite_count", 0) or 0),
+            view_count=int(data.get("view_count", 0) or 0),
+            description=data.get("description"),
+            country=data.get("country"),
+            city=data.get("city"),
         )
+
+    def matches_advanced_filters(
+        self,
+        min_seller_rating: Optional[float] = None,
+        min_seller_reviews: Optional[int] = None,
+        verified_seller_only: bool = False,
+        free_shipping_only: bool = False,
+        max_total_price: Optional[float] = None,
+        excluded_sellers: Optional[list[str]] = None,
+        country_codes: Optional[list[str]] = None,
+    ) -> bool:
+        """Verifica si el item cumple con los filtros avanzados."""
+        # Filtro de vendedor excluido
+        if excluded_sellers and self.user_login.lower() in [s.lower() for s in excluded_sellers]:
+            return False
+
+        # Filtro de reputación mínima del vendedor
+        if min_seller_rating is not None and self.user:
+            if self.user.feedback_reputation < min_seller_rating:
+                return False
+
+        # Filtro de mínimo de reseñas
+        if min_seller_reviews is not None and self.user:
+            if self.user.feedback_count < min_seller_reviews:
+                return False
+
+        # Filtro de vendedor verificado
+        if verified_seller_only and self.user:
+            if not self.user.is_verified:
+                return False
+
+        # Filtro de envío gratis
+        if free_shipping_only and not self.free_shipping:
+            return False
+
+        # Filtro de precio total máximo (con envío)
+        if max_total_price is not None and self.total_price:
+            if self.total_price > max_total_price:
+                return False
+
+        # Filtro de país
+        if country_codes and self.user:
+            if self.user.country_code and self.user.country_code.upper() not in [c.upper() for c in country_codes]:
+                return False
+
+        return True
 
 
 class VintedClient:
@@ -117,24 +227,41 @@ class VintedClient:
         order: str = "newest_first",
         per_page: int = 20,
         page: int = 1,
+        # Filtros avanzados (se aplican post-búsqueda)
+        min_seller_rating: Optional[float] = None,
+        min_seller_reviews: Optional[int] = None,
+        verified_seller_only: bool = False,
+        free_shipping_only: bool = False,
+        max_total_price: Optional[float] = None,
+        excluded_sellers: Optional[list[str]] = None,
+        country_codes: Optional[list[str]] = None,
     ) -> list[VintedItem]:
         """
         Busca artículos en Vinted con filtros completos.
 
         Args:
             query: Texto de búsqueda
-            catalog_ids: IDs de categorías (ej: [5, 1904] para ropa mujer, camisetas)
-            brand_ids: IDs de marcas (ej: [53] para Zara)
-            size_ids: IDs de tallas (ej: [206] para M)
+            catalog_ids: IDs de categorías
+            brand_ids: IDs de marcas
+            size_ids: IDs de tallas
             material_ids: IDs de materiales
-            color_ids: IDs de colores (ej: [1] para negro)
-            status_ids: IDs de estados (1=nuevo con etiquetas, 2=nuevo sin etiquetas, 3=muy bueno, 4=bueno, 5=satisfactorio)
+            color_ids: IDs de colores
+            status_ids: IDs de estados (6=nuevo con etiquetas, 1=nuevo sin etiquetas, 2=muy bueno, 3=bueno, 4=satisfactorio)
             price_from: Precio mínimo
             price_to: Precio máximo
             currency: Moneda (EUR, GBP, etc.)
             order: Orden (newest_first, price_low_to_high, price_high_to_low, relevance)
             per_page: Resultados por página (máx 96)
             page: Número de página
+
+            # Filtros avanzados (Premium)
+            min_seller_rating: Reputación mínima del vendedor (0-5)
+            min_seller_reviews: Número mínimo de reseñas del vendedor
+            verified_seller_only: Solo vendedores verificados
+            free_shipping_only: Solo productos con envío gratis
+            max_total_price: Precio máximo incluyendo envío
+            excluded_sellers: Lista de vendedores a excluir
+            country_codes: Lista de códigos de país permitidos
 
         Returns:
             Lista de VintedItem
@@ -184,7 +311,29 @@ class VintedClient:
                     return []
 
                 items = data.get("items", [])
-                return [VintedItem.from_api_response(item, self.domain) for item in items]
+                vinted_items = [VintedItem.from_api_response(item, self.domain) for item in items]
+
+                # Aplicar filtros avanzados
+                has_advanced_filters = any([
+                    min_seller_rating, min_seller_reviews, verified_seller_only,
+                    free_shipping_only, max_total_price, excluded_sellers, country_codes
+                ])
+
+                if has_advanced_filters:
+                    vinted_items = [
+                        item for item in vinted_items
+                        if item.matches_advanced_filters(
+                            min_seller_rating=min_seller_rating,
+                            min_seller_reviews=min_seller_reviews,
+                            verified_seller_only=verified_seller_only,
+                            free_shipping_only=free_shipping_only,
+                            max_total_price=max_total_price,
+                            excluded_sellers=excluded_sellers,
+                            country_codes=country_codes,
+                        )
+                    ]
+
+                return vinted_items
 
         except Exception as e:
             logger.error(f"Error en búsqueda: {e}")
@@ -205,6 +354,22 @@ class VintedClient:
         except Exception as e:
             logger.error(f"Error obteniendo item {item_id}: {e}")
             return None
+
+    async def get_user_items(self, user_id: int, per_page: int = 20) -> list[VintedItem]:
+        """Obtiene los artículos de un vendedor específico."""
+        session = await self._get_session()
+        url = f"{self.api_url}/users/{user_id}/items"
+
+        try:
+            async with session.get(url, params={"per_page": per_page}) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    items = data.get("items", [])
+                    return [VintedItem.from_api_response(item, self.domain) for item in items]
+                return []
+        except Exception as e:
+            logger.error(f"Error obteniendo items del usuario {user_id}: {e}")
+            return []
 
     async def close(self) -> None:
         """Cierra la sesión HTTP."""
