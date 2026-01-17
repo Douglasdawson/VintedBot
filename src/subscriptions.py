@@ -36,8 +36,16 @@ class Plan:
     def to_display_string(self) -> str:
         """Genera descripción del plan para mostrar."""
         features = []
-        features.append(f"📊 Máximo {self.max_alerts} alertas" if self.max_alerts > 0 else "📊 Alertas ilimitadas")
-        features.append(f"⏱️ Escaneo cada {self.scan_interval} segundos")
+        features.append(f"📊 Máximo {self.max_alerts} alerta" if self.max_alerts == 1 else f"📊 Máximo {self.max_alerts} alertas" if self.max_alerts > 0 else "📊 Alertas ilimitadas")
+
+        # Formatear intervalo de escaneo
+        if self.scan_interval >= 3600:
+            interval_text = f"{self.scan_interval // 3600} hora" if self.scan_interval == 3600 else f"{self.scan_interval // 3600} horas"
+        elif self.scan_interval >= 60:
+            interval_text = f"{self.scan_interval // 60} minutos" if self.scan_interval > 60 else "1 minuto"
+        else:
+            interval_text = f"{self.scan_interval} segundos"
+        features.append(f"⏱️ Escaneo cada {interval_text}")
 
         if self.sniper_mode:
             features.append("🎯 Modo Sniper activado")
@@ -60,8 +68,8 @@ PLANS = {
     PlanType.FREE: Plan(
         type=PlanType.FREE,
         name="Gratuito",
-        max_alerts=2,
-        scan_interval=300,  # 5 minutos
+        max_alerts=1,
+        scan_interval=3600,  # 1 hora
         sniper_mode=False,
         daily_summary=False,
         price_alerts=False,

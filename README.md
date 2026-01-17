@@ -5,8 +5,8 @@ Bot de alertas premium para Vinted con sistema de suscripciones, notificaciones 
 ## Características
 
 ### Plan Gratuito
-- 2 alertas activas
-- Escaneo cada 5 minutos
+- 1 alerta activa
+- Escaneo cada 1 hora
 - Filtros básicos (búsqueda, precio, categoría, estado, color)
 
 ### Plan Pro (4.99€/mes)
