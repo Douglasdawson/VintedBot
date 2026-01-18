@@ -17,6 +17,7 @@ from src.scanner import VintedScanner
 from src.subscriptions import SubscriptionManager
 from src.statistics import StatisticsManager
 from src.notifications import NotificationManager, SniperMode
+from src.ai_assistant import AIAssistant
 
 # Configurar logging
 logging.basicConfig(
@@ -52,6 +53,7 @@ class VintedAlertBot:
         self.statistics_manager: StatisticsManager = None
         self.notification_manager: NotificationManager = None
         self.sniper_mode: SniperMode = None
+        self.ai_assistant: AIAssistant = None
 
     async def setup(self) -> None:
         """Inicializa todos los componentes."""
@@ -92,6 +94,15 @@ class VintedAlertBot:
         # Modo Sniper
         self.sniper_mode = SniperMode(scan_interval=30)
         logger.info("Modo Sniper disponible")
+
+        # Asistente IA (opcional - requiere OPENAI_API_KEY)
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            self.ai_assistant = AIAssistant(openai_key)
+            self.telegram.ai_assistant = self.ai_assistant
+            logger.info("Asistente IA inicializado")
+        else:
+            logger.warning("OPENAI_API_KEY no configurado - funciones IA deshabilitadas")
 
         # Scanner
         self.scanner = VintedScanner(

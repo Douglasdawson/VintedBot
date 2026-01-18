@@ -18,6 +18,7 @@ from telegram.ext import (
 
 from .database import Database, Alert
 from .subscriptions import SubscriptionManager, PlanType, PLANS
+from .ai_assistant import AIAssistant
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,7 @@ class TelegramBot:
         self.subscription_manager: Optional[SubscriptionManager] = None
         self.notification_manager = None
         self.statistics_manager = None
+        self.ai_assistant: Optional[AIAssistant] = None
 
     def setup(self) -> Application:
         """Configura y devuelve la aplicación del bot."""
@@ -161,8 +163,19 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("stats", self.cmd_stats))
         self.application.add_handler(CommandHandler("config", self.cmd_config))
         self.application.add_handler(CommandHandler("sniper", self.cmd_sniper))
+
+        # Comandos de IA
+        self.application.add_handler(CommandHandler("buscar", self.cmd_ai_search))
+        self.application.add_handler(CommandHandler("analizar", self.cmd_ai_analyze))
+        self.application.add_handler(CommandHandler("chat", self.cmd_ai_chat))
+
         self.application.add_handler(conv_handler)
         self.application.add_handler(CallbackQueryHandler(self.callback_handler))
+
+        # Handler para mensajes de texto (IA conversacional)
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message)
+        )
 
         return self.application
 
@@ -179,21 +192,22 @@ class TelegramBot:
 Hola {user.first_name}! Bienvenido al Bot de Alertas de Vinted.
 
 Con este bot podrás:
-- Crear alertas personalizadas con filtros avanzados
+- Crear alertas con lenguaje natural usando IA
 - Recibir notificaciones instantáneas de nuevos productos
-- Activar modo Sniper para ofertas relámpago
+- Analizar si un producto es un chollo
+- Detectar posibles defectos o falsificaciones
 - Ver estadísticas y análisis de precios
-- Recibir alertas de bajada de precio
 
-*Comandos disponibles:*
-/nueva - Crear una nueva alerta
-/alertas - Ver y gestionar tus alertas
-/plan - Ver tu plan actual
-/planes - Ver planes disponibles
-/stats - Ver tus estadísticas
-/config - Configurar notificaciones
-/sniper - Activar/desactivar modo sniper
-/ayuda - Ver ayuda detallada
+*Comandos principales:*
+/nueva - Crear alerta paso a paso
+/buscar - Crear alerta con IA (ej: /buscar Nike Air Max negras talla 42)
+/alertas - Ver y gestionar alertas
+/analizar - Analizar un producto
+
+*Más opciones:*
+/plan /planes /stats /config /sniper /ayuda
+
+O simplemente escríbeme lo que buscas y te ayudo.
         """
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -202,15 +216,22 @@ Con este bot podrás:
         help_text = """
 *Guía de uso del Bot de Vinted*
 
-*Crear alertas:*
-Usa /nueva para crear una alerta paso a paso. Podrás configurar:
-- Nombre de la alerta
-- Palabras clave de búsqueda
-- Rango de precios
-- Categorías
-- Estado del producto
-- Colores
-- Filtros avanzados (Pro)
+*Crear alertas con IA:*
+Usa /buscar seguido de lo que buscas:
+`/buscar zapatillas Nike negras talla 42 menos de 50€`
+
+La IA interpretará tu búsqueda y creará la alerta.
+
+*Crear alertas manual:*
+Usa /nueva para crear una alerta paso a paso.
+
+*Analizar productos:*
+- /analizar [URL] - Analiza si es chollo y detecta defectos
+- Envía una URL de Vinted para análisis automático
+
+*Asistente IA:*
+Escríbeme cualquier pregunta sobre Vinted o dime qué buscas.
+Ejemplo: "Busco una chaqueta de invierno barata"
 
 *Gestionar alertas:*
 Usa /alertas para:
@@ -849,7 +870,36 @@ Usa /alertas para:
         data = query.data
         user_id = update.effective_user.id
 
-        if data.startswith("toggle_"):
+        # Callbacks de IA
+        if data.startswith("ai_confirm_"):
+            if user_id in user_alert_data and user_alert_data[user_id].get("from_ai"):
+                alert_data = user_alert_data[user_id]
+                alert = Alert(
+                    id=None,
+                    user_id=user_id,
+                    name=alert_data.get("name", "Alerta IA"),
+                    query=alert_data.get("query"),
+                    price_from=alert_data.get("price_from"),
+                    price_to=alert_data.get("price_to"),
+                    is_active=True,
+                )
+                await self.db.add_alert(alert)
+                user_alert_data.pop(user_id, None)
+                await query.message.reply_text(
+                    f"✅ Alerta *{alert.name}* creada con IA!\n"
+                    f"Usa /alertas para verla.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.message.reply_text("❌ No hay datos de alerta pendientes.")
+            return
+
+        elif data == "ai_cancel":
+            user_alert_data.pop(user_id, None)
+            await query.message.reply_text("❌ Cancelado.")
+            return
+
+        elif data.startswith("toggle_"):
             alert_id = int(data.split("_")[1])
             new_status = await self.db.toggle_alert(alert_id)
             status_text = "activada" if new_status else "pausada"
@@ -983,3 +1033,209 @@ Usa /alertas para:
         except Exception as e:
             logger.error(f"Error enviando notificación a {user_id}: {e}")
             return False
+
+    # ==================== COMANDOS DE IA ====================
+
+    async def cmd_ai_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Comando /buscar - Crea una alerta usando lenguaje natural con IA."""
+        user_id = update.effective_user.id
+
+        if not self.ai_assistant or not self.ai_assistant.is_available:
+            await update.message.reply_text(
+                "🤖 El asistente de IA no está disponible.\n"
+                "Usa /nueva para crear una alerta manualmente."
+            )
+            return
+
+        # Obtener el texto después del comando
+        if context.args:
+            search_text = " ".join(context.args)
+        else:
+            await update.message.reply_text(
+                "🔍 *Búsqueda con IA*\n\n"
+                "Escribe qué buscas después del comando:\n"
+                "`/buscar zapatillas Nike negras talla 42 menos de 50€`\n\n"
+                "La IA interpretará tu búsqueda y creará la alerta automáticamente.",
+                parse_mode="Markdown"
+            )
+            return
+
+        await update.message.reply_text("🤖 Analizando tu búsqueda...")
+
+        # Verificar límite de alertas
+        alerts = await self.db.get_alerts_by_user(user_id)
+        can_create, message = await self.subscription_manager.check_can_create_alert(user_id, len(alerts))
+        if not can_create:
+            await update.message.reply_text(f"⚠️ {message}")
+            return
+
+        # Parsear con IA
+        parsed = await self.ai_assistant.parse_natural_language_alert(search_text)
+
+        if not parsed or parsed.confidence < 0.3:
+            await update.message.reply_text(
+                "❌ No pude entender tu búsqueda.\n"
+                "Intenta ser más específico o usa /nueva para crear la alerta manualmente."
+            )
+            return
+
+        # Mostrar lo que entendió la IA
+        summary = f"🤖 *Entendí esto:*\n\n"
+        summary += f"*Nombre:* {parsed.name}\n"
+        if parsed.query:
+            summary += f"*Búsqueda:* {parsed.query}\n"
+        if parsed.price_from or parsed.price_to:
+            summary += f"*Precio:* {parsed.price_from or 0}€ - {parsed.price_to or '∞'}€\n"
+        if parsed.brand:
+            summary += f"*Marca:* {parsed.brand}\n"
+        if parsed.size:
+            summary += f"*Talla:* {parsed.size}\n"
+        if parsed.color:
+            summary += f"*Color:* {parsed.color}\n"
+        if parsed.status:
+            summary += f"*Estado:* {parsed.status}\n"
+
+        summary += f"\n_Confianza: {int(parsed.confidence * 100)}%_"
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Crear alerta", callback_data=f"ai_confirm_{user_id}"),
+                InlineKeyboardButton("❌ Cancelar", callback_data="ai_cancel"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Guardar datos para confirmación
+        user_alert_data[user_id] = {
+            "name": parsed.name,
+            "query": parsed.query,
+            "price_from": parsed.price_from,
+            "price_to": parsed.price_to,
+            "from_ai": True,
+        }
+
+        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=reply_markup)
+
+    async def cmd_ai_analyze(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Comando /analizar - Analiza un producto de Vinted."""
+        if not self.ai_assistant or not self.ai_assistant.is_available:
+            await update.message.reply_text(
+                "🤖 El asistente de IA no está disponible en este momento."
+            )
+            return
+
+        # Verificar si hay URL
+        if not context.args:
+            await update.message.reply_text(
+                "🔍 *Analizar producto*\n\n"
+                "Envía una URL de Vinted para analizar:\n"
+                "`/analizar https://www.vinted.es/items/123456`\n\n"
+                "O simplemente pega la URL y la analizaré automáticamente.",
+                parse_mode="Markdown"
+            )
+            return
+
+        url = context.args[0]
+
+        # Verificar que es una URL de Vinted
+        if "vinted" not in url.lower():
+            await update.message.reply_text("⚠️ Por favor, envía una URL válida de Vinted.")
+            return
+
+        await update.message.reply_text("🔍 Analizando producto...")
+
+        # TODO: Implementar obtención de datos del producto desde la URL
+        # Por ahora, mostramos un mensaje de ejemplo
+        await update.message.reply_text(
+            "🤖 *Análisis del producto*\n\n"
+            "Para un análisis completo, necesito obtener los datos del producto.\n"
+            "Esta función estará disponible próximamente.\n\n"
+            "_Mientras tanto, puedo analizar productos que me envíes por notificación._",
+            parse_mode="Markdown"
+        )
+
+    async def cmd_ai_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Comando /chat - Inicia una conversación con el asistente IA."""
+        if not self.ai_assistant or not self.ai_assistant.is_available:
+            await update.message.reply_text(
+                "🤖 El asistente de IA no está disponible en este momento."
+            )
+            return
+
+        if context.args:
+            question = " ".join(context.args)
+            response = await self.ai_assistant.smart_chat_response(question)
+            await update.message.reply_text(f"🤖 {response}")
+        else:
+            await update.message.reply_text(
+                "🤖 *Asistente de Vinted*\n\n"
+                "Puedes preguntarme:\n"
+                "• Consejos para encontrar chollos\n"
+                "• Cómo usar el bot\n"
+                "• Tips de compra segura\n"
+                "• Cualquier duda sobre Vinted\n\n"
+                "Escribe tu pregunta después del comando:\n"
+                "`/chat ¿cómo encontrar las mejores ofertas?`",
+                parse_mode="Markdown"
+            )
+
+    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Maneja mensajes de texto que no son comandos."""
+        if not update.message or not update.message.text:
+            return
+
+        text = update.message.text.strip()
+        user_id = update.effective_user.id
+
+        # Detectar URLs de Vinted para análisis automático
+        if "vinted" in text.lower() and ("http" in text.lower() or "www" in text.lower()):
+            if self.ai_assistant and self.ai_assistant.is_available:
+                await update.message.reply_text(
+                    "🔍 Detecté una URL de Vinted. Usa /analizar para analizar el producto."
+                )
+            return
+
+        # Si tiene IA disponible, usar asistente conversacional
+        if self.ai_assistant and self.ai_assistant.is_available:
+            # Detectar si parece una búsqueda
+            search_keywords = ["busco", "quiero", "necesito", "encuentra", "buscar", "alertar"]
+            is_search = any(keyword in text.lower() for keyword in search_keywords)
+
+            if is_search:
+                # Intentar crear alerta con IA
+                parsed = await self.ai_assistant.parse_natural_language_alert(text)
+                if parsed and parsed.confidence > 0.5:
+                    # Verificar límite de alertas
+                    alerts = await self.db.get_alerts_by_user(user_id)
+                    can_create, msg = await self.subscription_manager.check_can_create_alert(user_id, len(alerts))
+
+                    if can_create:
+                        summary = f"🤖 *¿Quieres crear esta alerta?*\n\n"
+                        summary += f"*{parsed.name}*\n"
+                        if parsed.query:
+                            summary += f"Búsqueda: _{parsed.query}_\n"
+                        if parsed.price_from or parsed.price_to:
+                            summary += f"Precio: {parsed.price_from or 0}€ - {parsed.price_to or '∞'}€\n"
+
+                        keyboard = [
+                            [
+                                InlineKeyboardButton("✅ Sí, crear", callback_data=f"ai_confirm_{user_id}"),
+                                InlineKeyboardButton("❌ No", callback_data="ai_cancel"),
+                            ]
+                        ]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+
+                        user_alert_data[user_id] = {
+                            "name": parsed.name,
+                            "query": parsed.query,
+                            "price_from": parsed.price_from,
+                            "price_to": parsed.price_to,
+                            "from_ai": True,
+                        }
+
+                        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=reply_markup)
+                        return
+
+            # Respuesta general del asistente
+            response = await self.ai_assistant.smart_chat_response(text)
+            await update.message.reply_text(f"🤖 {response}")
